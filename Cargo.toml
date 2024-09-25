@@ -1,0 +1,17 @@
+[package]
+name = "crs-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dirs = "5.0.1"
+clap = {version="4.5.18", features=["derive"]}
+actix-web = "4.9.0"
+actix-files = "0.6.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+celestia-types = "0.5.0"
+celestia-rpc = "0.4.1"
+tokio = {version="1.40.0", features=["rt", "rt-multi-thread", "macros"]}
+sp1-sdk = "3.0.0-rc1"
+serde_cbor = "0.11.2"
