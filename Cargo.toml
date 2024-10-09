@@ -15,3 +15,9 @@ celestia-rpc = "0.4.1"
 tokio = {version="1.40.0", features=["rt", "rt-multi-thread", "macros", "signal"]}
 sp1-sdk = "3.0.0-rc1"
 serde_cbor = "0.11.2"
+tendermint = { version = "0.35.0", default-features = false }
+subtle-encoding = "0.5.1"
+tendermint-light-client-verifier = { version = "0.35.0", default-features = false, features = [
+    "rust-crypto",
+] }
+reqwest = { version = "0.11", features = ["json"] }

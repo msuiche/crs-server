@@ -10,9 +10,7 @@ struct Args {
     #[arg(short, long)]
     crs_directory: Option<String>,
     #[arg(short, long)]
-    ln_url: Option<String>,
-    #[arg(long)]
-    ln_auth: Option<String>,
+    tm_rpc: Option<String>,
 }
 
 pub fn get_crs_directory() -> Result<PathBuf, String> {
@@ -44,14 +42,8 @@ pub fn get_crs_directory() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-pub fn get_ln_url() -> String {
-    Args::parse().ln_url
-        .or_else(|| env::var("LN_URL").ok())
-        .unwrap_or_else(|| "ws://localhost:26658".to_string())
-}
-
-pub fn get_celestia_node_auth_token() -> Result<String, String> {
-    Args::parse().ln_auth
-        .or_else(|| env::var("CELESTIA_NODE_AUTH_TOKEN").ok())
-        .ok_or_else(|| "CELESTIA_NODE_AUTH_TOKEN is not set".to_string())
+pub fn get_tendermint_rpc_url() -> Result<String, String> {
+    Args::parse().tm_rpc
+        .or_else(|| env::var("TM_RPC").ok())
+        .ok_or_else(|| "TM_RPC is not set".to_string())
 }
