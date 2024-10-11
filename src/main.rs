@@ -3,7 +3,7 @@
 use core::time::Duration;
 mod utils;
 use tm_rpc_utils::TendermintRPCClient;
-use utils::{get_crs_directory, get_tendermint_rpc_url};
+use utils::{get_crs_directory, get_tendermint_rpc_url, get_server_url, strip_header};
 use celestia_rpc::{
     HeaderClient,
     ShareClient,
@@ -27,8 +27,10 @@ use sp1_sdk::{HashableKey, Prover, SP1VerifyingKey};
 use sp1_sdk::{SP1Proof, SP1ProofWithPublicValues};
 use sp1_sdk::{ProverClient, SP1Stdin};
 use actix_web::{App, HttpServer, web, Responder, HttpResponse};
+use actix_cors::Cors;
 mod tm_rpc_utils;
 mod tm_rpc_types;
+use tokio::signal;
 
 /// The ELF (executable and linkable format) file for the Succinct RISC-V zkVM.
 pub const ELF: &[u8] = include_bytes!("../riscv32im-succinct-zkvm-elf");
@@ -187,10 +189,21 @@ pub async fn groth_proof_worker(app_state: web::Data<AppState>) {
             Ok(_) => println!("Successfully wrote newest_groth16_proved_header.json"),
             Err(e) => eprintln!("Failed to write newest_groth16_proved_header.json: {}", e),
         }
-        // Write the new proof to the proof_file
+
         match std::fs::write(app_state.app_dir.join("newest_groth16_proof.json"), serde_json::to_string(&resultant_groth16_proof).expect("could not json serialize new groth16 proof")) {
             Ok(_) => println!("Successfully wrote newest_groth16_proof.json"),
             Err(e) => eprintln!("Failed to write newest_groth16_proof.json: {}", e),
+        }
+        let groth_inner = resultant_groth16_proof.clone().proof.try_as_groth_16().expect("not a groth16 proof");
+        // Write the new proof to the proof_file
+        match std::fs::write(app_state.app_dir.join("newest_groth16_proof_inner.json"), serde_json::to_string(&groth_inner).expect("could not json serialize new groth16 proof")) {
+            Ok(_) => println!("Successfully wrote newest_groth16_proof_inner.json"),
+            Err(e) => eprintln!("Failed to write newest_groth16_proof_inner.json: {}", e),
+        }
+        // Write a bincode version as well
+        match std::fs::write(app_state.app_dir.join("newest_groth16_proof_inner.bin"), bincode::serialize(&groth_inner).expect("could not json serialize new groth16 proof")) {
+            Ok(_) => println!("Successfully wrote newest_groth16_proof_inner.bin"),
+            Err(e) => eprintln!("Failed to write newest_groth16_proof_inner.bin: {}", e),
         }
         // update the values in the server state
         *app_state.latest_groth16_header.lock().unwrap() = Some(header_to_try);
@@ -207,8 +220,34 @@ async fn get_latest_header(app_state: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(app_state.newest_header.lock().unwrap().clone())
 }
 
+/*async fn get_latest_groth16_proved_stripped_header(app_state: web::Data<AppState>) -> impl Responder {
+    let stripped = app_state.latest_groth16_header.lock().unwrap().clone()
+}
+
+async fn get_net_stripped_header(app_state: web::Data<AppState>) -> impl Responder {
+    HttpResponse::Ok().json(app_state.latest_groth16_header.lock().unwrap().clone())
+}*/
+
 async fn get_latest_groth16_proved_header(app_state: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(app_state.latest_groth16_header.lock().unwrap().clone())
+}
+
+async fn get_latest_groth16_proved_stripped_header(app_state: web::Data<AppState>) -> impl Responder {
+    let h = app_state.latest_groth16_header.lock().unwrap().clone().map_or(None, |h| {Some(strip_header(&h))});
+    HttpResponse::Ok().json(h)
+}
+
+async fn get_net_head_stripped(app_state: web::Data<AppState>) -> impl Responder {
+    let peer_id = match app_state.client.fetch_peer_id().await {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Failed to fetch peer ID: {}", e)),
+    };
+    let net_height = app_state.client.get_latest_block_height().await;
+    let head = match app_state.client.fetch_light_block(net_height, peer_id).await {
+        Ok(lb) => strip_header(&lb),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Failed to fetch net head: {}", e)),
+    };
+    HttpResponse::Ok().json(head)
 }
 
 async fn get_latest_proof(app_state: web::Data<AppState>) -> impl Responder {
@@ -216,7 +255,9 @@ async fn get_latest_proof(app_state: web::Data<AppState>) -> impl Responder {
 }
 
 async fn get_latest_groth16_proof(app_state: web::Data<AppState>) -> impl Responder {
-    HttpResponse::Ok().json(app_state.latest_groth16_proof.lock().unwrap().clone())
+    let r = app_state.latest_groth16_proof.lock().unwrap().clone();
+    let proof = r.map_or_else(|| None, |p| p.proof.try_as_groth_16());
+    HttpResponse::Ok().json(proof)
 }
 
 #[derive(Clone)]
@@ -258,7 +299,7 @@ async fn main() -> std::io::Result<()> {
 
     let groth16_proof_file = std::fs::File::open(app_dir.join("newest_groth16_proof.json"));
     let latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>> = Arc::new(Mutex::new(groth16_proof_file.map_err(|_| ()).map_or_else(|_| None, |file| {
-        serde_json::from_reader(file).expect("could not deserialize newest_groth16_proof")
+        serde_json::from_reader(file).ok()
     })));
 
     let newest_groth16_proved_header_file = std::fs::File::open(app_dir.join("newest_groth16_proved_header.json"));
@@ -280,18 +321,29 @@ async fn main() -> std::io::Result<()> {
     let groth16_handle = tokio::spawn(groth_proof_worker(app_state.clone()));
 
     let server_handle = HttpServer::new(move || {
+
+        let cors = Cors::permissive();
+
         App::new()
+            .wrap(cors)
             .app_data(app_state.clone())
             .route("/header", web::get().to(get_latest_header))
             .route("/proof", web::get().to(get_latest_proof))
             .route("/groth16_proof", web::get().to(get_latest_groth16_proof))
-            .route("/groth16_header", web::get().to(get_latest_groth16_proved_header))
+            .route("/groth16_header", web::get().to(get_latest_groth16_proved_stripped_header))
+            .route("/net_head", web::get().to(get_net_head_stripped))
         })
-        .bind("127.0.0.1:8080")?
+        .bind(get_server_url())?
         .run()
-        .into_future();
+        .await;
+        
+        /*signal::ctrl_c().await?;
+        println!("Shutting down gracefully");
+        stark_handle.abort();
+        groth16_handle.abort();
+        server_handle.handle().stop(true).await;*/
         /* .handle()
         .into_future();*/
-    let (_, _, _) = tokio::join!(stark_handle, groth16_handle, server_handle);
+    //let (_, _, _) = tokio::join!(stark_handle, groth16_handle, server_handle);
     Ok(())
 }

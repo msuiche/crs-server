@@ -3,6 +3,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::fs;
 use dirs;
+use tendermint_light_client_verifier::{
+    options::Options, types::LightBlock, ProdVerifier, Verdict, Verifier,
+};
+use hex;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -11,6 +15,22 @@ struct Args {
     crs_directory: Option<String>,
     #[arg(short, long)]
     tm_rpc: Option<String>,
+    #[arg(short, long)]
+    server_url: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BasicHeaderResponse {
+    hash: String,
+    height: u64,
+}
+
+pub fn strip_header(header: &LightBlock) -> BasicHeaderResponse {
+    let hash = header.signed_header.header().hash().as_bytes().to_vec();
+    BasicHeaderResponse {
+        hash: hex::encode(hash),
+        height: header.height().value(),
+    }
 }
 
 pub fn get_crs_directory() -> Result<PathBuf, String> {
@@ -40,6 +60,20 @@ pub fn get_crs_directory() -> Result<PathBuf, String> {
     }
 
     Ok(dir)
+}
+
+pub fn get_server_url() -> String {
+    let args = Args::parse();
+    if let Some(server_url) = args.server_url {
+        server_url
+    }
+    // Check environment variable
+    else if let Ok(server_url) = env::var("SERVER_URL") {
+        server_url
+    }
+    else {
+        "0.0.0.0:8000".to_string()
+    }
 }
 
 pub fn get_tendermint_rpc_url() -> Result<String, String> {
