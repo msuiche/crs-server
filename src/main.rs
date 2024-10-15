@@ -1,6 +1,3 @@
-#![feature(duration_constructors)]
-
-use core::time::Duration;
 mod utils;
 use tm_rpc_utils::TendermintRPCClient;
 use utils::{get_crs_directory, get_tendermint_rpc_url, get_server_url, strip_header};
@@ -9,7 +6,8 @@ use celestia_rpc::{
     ShareClient,
     Client,
 };
-use celestia_types::{ExtendedHeader};
+use celestia_types::{ExtendedHeader, Height, nmt::Namespace};
+use celestia_rpc::BlobClient;
 
 use tendermint_light_client_verifier::{
     options::Options, types::LightBlock, ProdVerifier, Verdict, Verifier,
@@ -22,6 +20,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     fs,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use sp1_sdk::{HashableKey, Prover, SP1VerifyingKey};
 use sp1_sdk::{SP1Proof, SP1ProofWithPublicValues};
@@ -30,7 +29,7 @@ use actix_web::{App, HttpServer, web, Responder, HttpResponse};
 use actix_cors::Cors;
 mod tm_rpc_utils;
 mod tm_rpc_types;
-use tokio::signal;
+// use tokio::signal;
 
 /// The ELF (executable and linkable format) file for the Succinct RISC-V zkVM.
 pub const ELF: &[u8] = include_bytes!("../riscv32im-succinct-zkvm-elf");
@@ -108,7 +107,7 @@ pub async fn stark_proof_worker(app_state: web::Data<AppState>) {
         *app_state.newest_header.lock().unwrap() = header_to_try;
         *app_state.latest_proof.lock().unwrap() = resultant_proof;
         println!("proved header height {:?}", app_state.newest_header.lock().unwrap().height());
-        let five_minute = std::time::Duration::from_mins(5);
+        let five_minute = std::time::Duration::from_secs(5 * 60);
         let sleep_duration = five_minute.saturating_sub(elapsed_time);
         std::thread::sleep(sleep_duration);
 
@@ -209,7 +208,7 @@ pub async fn groth_proof_worker(app_state: web::Data<AppState>) {
         *app_state.latest_groth16_header.lock().unwrap() = Some(header_to_try);
         *app_state.latest_groth16_proof.lock().unwrap() = Some(resultant_groth16_proof);
         println!("groth16 proved header height {:?}", app_state.newest_header.lock().unwrap().height());
-        let ten_mins = std::time::Duration::from_mins(10);
+        let ten_mins = std::time::Duration::from_secs(10 * 60);
         let sleep_duration = ten_mins.saturating_sub(elapsed_time);
         std::thread::sleep(sleep_duration);
 
@@ -260,6 +259,12 @@ async fn get_latest_groth16_proof(app_state: web::Data<AppState>) -> impl Respon
     HttpResponse::Ok().json(proof)
 }
 
+struct RollupState {
+    sync_height: u64,
+    block_height: u64,
+    namespace: Namespace,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub app_dir: PathBuf,
@@ -269,6 +274,8 @@ pub struct AppState {
     pub latest_groth16_header: Arc<Mutex<Option<LightBlock>>>,
     pub latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>>,
     pub genesis_header: LightBlock,
+    pub rollup_state: Arc<Mutex<RollupState>>,
+    pub celestia_client: Arc<Client>,
 }
 
 #[tokio::main]
@@ -315,10 +322,30 @@ async fn main() -> std::io::Result<()> {
         latest_groth16_proof: latest_groth16_proof.clone(),
         latest_groth16_header: latest_groth16_proved_header.clone(),
         genesis_header: genesis_header,
+        rollup_state: Arc::new(Mutex::new(RollupState {
+            sync_height: std::env::var("START_HEIGHT")
+                .expect("Start height not provided")
+                .parse()
+                .expect("Could not parse start height"),
+            block_height: 1,
+            namespace: Namespace::new(
+                0,
+                &std::env::var("ROLLUP_NAMESPACE")
+                    .expect("Rollup namespace not provided")
+                    .into_bytes(),
+            )
+            .expect("Invalid namespace"),
+        })),
+        celestia_client: Arc::new(
+            Client::new("ws://localhost:26658", Some(&std::env::var("CELESTIA_TOKEN").expect("CELESTIA_TOKEN not set")))
+                .await
+                .expect("Failed creating Celestia RPC client"),
+        ),
     });
 
     let stark_handle = tokio::spawn(stark_proof_worker(app_state.clone()));
     let groth16_handle = tokio::spawn(groth_proof_worker(app_state.clone()));
+    let da_sync_handle = tokio::spawn(da_sync_worker(app_state.clone()));
 
     let server_handle = HttpServer::new(move || {
 
@@ -344,6 +371,76 @@ async fn main() -> std::io::Result<()> {
         server_handle.handle().stop(true).await;*/
         /* .handle()
         .into_future();*/
-    //let (_, _, _) = tokio::join!(stark_handle, groth16_handle, server_handle);
+    // let (_, _, _, _) = tokio::join!(stark_handle, groth16_handle, server_handle, da_sync_handle);
     Ok(())
+}
+
+pub async fn da_sync_worker(app_state: web::Data<AppState>) {
+    println!("Started DA sync worker");
+    loop {
+        let celestia_client = app_state.celestia_client.clone();
+
+        let network_head = celestia_client
+            .header_network_head()
+            .await
+            .expect("Could not get network head");
+
+        // Calculate the height from 3 weeks ago
+        let three_weeks_ago = SystemTime::now() - Duration::from_secs(3 * 7 * 24 * 60 * 60);
+        let three_weeks_ago_timestamp = three_weeks_ago
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        let mut current_height = app_state.rollup_state.lock().unwrap().sync_height;
+        while current_height <= network_head.height().into() {
+            let header = celestia_client
+                .header_get_by_height(current_height)
+                .await
+                .expect("Could not get header");
+
+            if header.time().unix_timestamp() as u64 >= three_weeks_ago_timestamp {
+                sync_da_height(&app_state, &celestia_client, current_height).await;
+            }
+
+            current_height += 1;
+        }
+
+        // Update the sync height
+        {
+            let mut rollup_state = app_state.rollup_state.lock().unwrap();
+            rollup_state.sync_height = network_head.height().value();
+        }
+
+        // Sleep for a short duration before the next sync attempt
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+async fn sync_da_height(app_state: &web::Data<AppState>, client: &Client, da_height: u64) {
+
+    let namespace = app_state.rollup_state.lock().unwrap().namespace;
+    let blobs = match client
+            .blob_get_all(da_height, &[namespace])
+            .await
+    {
+        Ok(Some(blobs)) => blobs,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            eprintln!("Error getting blobs at height {}: {}", da_height, e);
+            Vec::new()
+        }
+    };
+
+    for blob in &blobs {
+        // Assuming you have a Block struct and a deserialize method
+        // let block = Block::deserialize(&blob.data);
+        // Process the block...
+        println!("Processing blob at height {}", da_height);
+    }
+
+    // Update the block height
+    let mut rollup_state = app_state.rollup_state.lock().unwrap();
+    rollup_state.block_height += blobs.len() as u64;
+    println!("Synced {} blobs at height {}", blobs.len(), da_height);
 }
