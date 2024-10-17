@@ -6,23 +6,18 @@ use celestia_rpc::{
     ShareClient,
     Client,
 };
-use celestia_types::{ExtendedHeader, Height, nmt::Namespace};
-use celestia_rpc::BlobClient;
 
 use tendermint_light_client_verifier::{
     options::Options, types::LightBlock, ProdVerifier, Verdict, Verifier,
 };
 
-use std::future::IntoFuture;
-use std::io::Write;
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
     fs,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use sp1_sdk::{HashableKey, Prover, SP1VerifyingKey};
+use sp1_sdk::{HashableKey};
 use sp1_sdk::{SP1Proof, SP1ProofWithPublicValues};
 use sp1_sdk::{ProverClient, SP1Stdin};
 use actix_web::{App, HttpServer, web, Responder, HttpResponse};
@@ -261,12 +256,6 @@ async fn get_latest_groth16_proof(app_state: web::Data<AppState>) -> impl Respon
     HttpResponse::Ok().json(proof)
 }
 
-struct RollupState {
-    sync_height: u64,
-    block_height: u64,
-    namespace: Namespace,
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub app_dir: PathBuf,
@@ -281,39 +270,95 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let app_dir = get_crs_directory().expect("Could not open directory");
-    let tm_rpc_url = get_tendermint_rpc_url().expect("TM_RPC not set");
-
-    let tm_client = tm_rpc_utils::TendermintRPCClient::new(tm_rpc_url);
-    let peer_id = tm_client.fetch_peer_id().await.unwrap();
-
-    // Load the "zk genesis" header
-    let genesis_file = std::fs::File::open(app_dir.join("genesis.json"));
-    let genesis_header: LightBlock = if let Ok(file) = genesis_file {
-        serde_json::from_reader(file).expect("Failed to parse genesis.json")
-    } else {
-        println!("Genesis file not found, getting it from the tendermint RPC.");
-        let genesis = tm_client.fetch_light_block(1, peer_id).await.expect("could not fetch genesis from tendermint RPC");
-        serde_json::to_writer(&mut std::fs::File::create(app_dir.join("genesis.json")).expect("Failed to create genesis.json"), &genesis).expect("Failed to write genesis to genesis.json");
-        genesis
+    let app_dir = match get_crs_directory() {
+        Ok(dir) => dir,
+        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Could not open directory: {}", e))),
     };
 
-    let newest_header_file = std::fs::File::open(app_dir.join("newest_header.json"))
-        .expect("Failed to read newest_header.json");
-    let newest_header: Arc<Mutex<LightBlock>> = Arc::new(Mutex::new(serde_json::from_reader(newest_header_file).expect("Failed to parse newest_header.json")));
+    let tm_rpc_url = match get_tendermint_rpc_url() {
+        Ok(url) => url,
+        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("TM_RPC not set: {}", e))),
+    };
 
-    let proof_file = std::fs::File::open(app_dir.join("newest_proof.json")).expect("could not open newest_proof.json");
-    let latest_proof: Arc<Mutex<SP1ProofWithPublicValues>> = Arc::new(Mutex::new(serde_json::from_reader(proof_file).expect("could not deserialize proof")));
+    let tm_client = tm_rpc_utils::TendermintRPCClient::new(tm_rpc_url);
+    let peer_id = match tm_client.fetch_peer_id().await {
+        Ok(id) => id,
+        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to fetch peer ID: {}", e))),
+    };
 
-    let groth16_proof_file = std::fs::File::open(app_dir.join("newest_groth16_proof.json"));
-    let latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>> = Arc::new(Mutex::new(groth16_proof_file.map_err(|_| ()).map_or_else(|_| None, |file| {
-        serde_json::from_reader(file).ok()
-    })));
+    // Load the "zk genesis" header
+    let genesis_header: LightBlock = match std::fs::File::open(app_dir.join("genesis.json")) {
+        Ok(file) => {
+            match serde_json::from_reader(file) {
+                Ok(header) => header,
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to parse genesis.json: {}", e))),
+            }
+        },
+        Err(_) => {
+            println!("Genesis file not found, getting it from the tendermint RPC.");
+            let genesis = match tm_client.fetch_light_block(1, peer_id).await {
+                Ok(block) => block,
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Could not fetch genesis from tendermint RPC: {}", e))),
+            };
+            
+            let file = match std::fs::File::create(app_dir.join("genesis.json")) {
+                Ok(f) => f,
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create genesis.json: {}", e))),
+            };
+            
+            if let Err(e) = serde_json::to_writer(&file, &genesis) {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write genesis to genesis.json: {}", e)));
+            }
+            
+            genesis
+        }
+    };
+    let newest_header: Arc<Mutex<LightBlock>> = match std::fs::File::open(app_dir.join("newest_header.json")) {
+        Ok(file) => {
+            match serde_json::from_reader(file) {
+                Ok(header) => Arc::new(Mutex::new(header)),
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to parse newest_header.json: {}", e))),
+            }
+        },
+        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Failed to read newest_header.json: {}", e))),
+    };
 
-    let newest_groth16_proved_header_file = std::fs::File::open(app_dir.join("newest_groth16_proved_header.json"));
-    let latest_groth16_proved_header: Arc<Mutex<Option<LightBlock>>> = Arc::new(Mutex::new(newest_groth16_proved_header_file.map_err(|_| ()).map_or_else(|_| None, |file| {
-        serde_json::from_reader(file).expect("could not deserialize newest_groth16_proved_header")
-    })));
+    let latest_proof: Arc<Mutex<SP1ProofWithPublicValues>> = match std::fs::File::open(app_dir.join("newest_proof.json")) {
+        Ok(file) => {
+            match serde_json::from_reader(file) {
+                Ok(proof) => Arc::new(Mutex::new(proof)),
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to deserialize proof: {}", e))),
+            }
+        },
+        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Could not open newest_proof.json: {}", e))),
+    };
+
+    let latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>> = Arc::new(Mutex::new(
+        match std::fs::File::open(app_dir.join("newest_groth16_proof.json")) {
+            Ok(file) => {
+                match serde_json::from_reader(file) {
+                    Ok(proof) => Some(proof),
+                    Err(_) => None,
+                }
+            },
+            Err(_) => None,
+        }
+    ));
+
+    let latest_groth16_proved_header: Arc<Mutex<Option<LightBlock>>> = Arc::new(Mutex::new(
+        match std::fs::File::open(app_dir.join("newest_groth16_proved_header.json")) {
+            Ok(file) => {
+                match serde_json::from_reader(file) {
+                    Ok(header) => Some(header),
+                    Err(e) => {
+                        eprintln!("Failed to deserialize newest_groth16_proved_header: {}", e);
+                        None
+                    },
+                }
+            },
+            Err(_) => None,
+        }
+    ));
 
     let app_state = web::Data::new(AppState {
         app_dir: app_dir,
@@ -330,11 +375,11 @@ async fn main() -> std::io::Result<()> {
         ),
     });
 
-    let stark_handle = tokio::spawn(stark_proof_worker(app_state.clone()));
-    let groth16_handle = tokio::spawn(groth_proof_worker(app_state.clone()));
-    let da_sync_handle = tokio::spawn(da_sync_worker(app_state.clone()));
+    let _stark_handle = tokio::spawn(stark_proof_worker(app_state.clone()));
+    let _groth16_handle = tokio::spawn(groth_proof_worker(app_state.clone()));
+    let _da_sync_handle = tokio::spawn(da_sync_worker(app_state.clone()));
 
-    let server_handle = HttpServer::new(move || {
+    let _server_handle = HttpServer::new(move || {
 
         let cors = Cors::permissive();
 
@@ -346,6 +391,8 @@ async fn main() -> std::io::Result<()> {
             .route("/groth16_proof", web::get().to(get_latest_groth16_proof))
             .route("/groth16_header", web::get().to(get_latest_groth16_proved_stripped_header))
             .route("/net_head", web::get().to(get_net_head_stripped))
+            // Do we want this one?
+            .route("/groth16_full_header", web::get().to(get_latest_groth16_proved_header))
         })
         .bind(get_server_url())?
         .run()
@@ -407,7 +454,7 @@ pub async fn da_sync_worker(app_state: web::Data<AppState>) {
     }
 }
 
-async fn sync_da_height(app_state: &web::Data<AppState>, client: &Client, da_height: u64, eds_dir: &Path) {
+async fn sync_da_height(_app_state: &web::Data<AppState>, client: &Client, da_height: u64, eds_dir: &Path) {
     let header = client
         .header_get_by_height(da_height)
         .await

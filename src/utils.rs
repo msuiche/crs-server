@@ -1,11 +1,9 @@
 use clap::Parser;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::fs;
 use dirs;
-use tendermint_light_client_verifier::{
-    options::Options, types::LightBlock, ProdVerifier, Verdict, Verifier,
-};
+use tendermint_light_client_verifier::{types::LightBlock};
 use hex;
 
 #[derive(Parser, Debug)]
