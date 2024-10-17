@@ -29,6 +29,8 @@ use actix_web::{App, HttpServer, web, Responder, HttpResponse};
 use actix_cors::Cors;
 mod tm_rpc_utils;
 mod tm_rpc_types;
+
+use std::path::Path;
 // use tokio::signal;
 
 /// The ELF (executable and linkable format) file for the Succinct RISC-V zkVM.
@@ -274,7 +276,6 @@ pub struct AppState {
     pub latest_groth16_header: Arc<Mutex<Option<LightBlock>>>,
     pub latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>>,
     pub genesis_header: LightBlock,
-    pub rollup_state: Arc<Mutex<RollupState>>,
     pub celestia_client: Arc<Client>,
 }
 
@@ -322,20 +323,6 @@ async fn main() -> std::io::Result<()> {
         latest_groth16_proof: latest_groth16_proof.clone(),
         latest_groth16_header: latest_groth16_proved_header.clone(),
         genesis_header: genesis_header,
-        rollup_state: Arc::new(Mutex::new(RollupState {
-            sync_height: std::env::var("START_HEIGHT")
-                .expect("Start height not provided")
-                .parse()
-                .expect("Could not parse start height"),
-            block_height: 1,
-            namespace: Namespace::new(
-                0,
-                &std::env::var("ROLLUP_NAMESPACE")
-                    .expect("Rollup namespace not provided")
-                    .into_bytes(),
-            )
-            .expect("Invalid namespace"),
-        })),
         celestia_client: Arc::new(
             Client::new("ws://localhost:26658", Some(&std::env::var("CELESTIA_TOKEN").expect("CELESTIA_TOKEN not set")))
                 .await
@@ -377,6 +364,9 @@ async fn main() -> std::io::Result<()> {
 
 pub async fn da_sync_worker(app_state: web::Data<AppState>) {
     println!("Started DA sync worker");
+    let eds_dir = app_state.app_dir.join("eds");
+    fs::create_dir_all(&eds_dir).expect("Failed to create eds directory");
+
     loop {
         let celestia_client = app_state.celestia_client.clone();
 
@@ -392,7 +382,7 @@ pub async fn da_sync_worker(app_state: web::Data<AppState>) {
             .expect("Time went backwards")
             .as_secs();
 
-        let mut current_height = app_state.rollup_state.lock().unwrap().sync_height;
+        let mut current_height = get_last_synced_height(&eds_dir).unwrap_or(1);
         while current_height <= network_head.height().into() {
             let header = celestia_client
                 .header_get_by_height(current_height)
@@ -400,16 +390,16 @@ pub async fn da_sync_worker(app_state: web::Data<AppState>) {
                 .expect("Could not get header");
 
             if header.time().unix_timestamp() as u64 >= three_weeks_ago_timestamp {
-                sync_da_height(&app_state, &celestia_client, current_height).await;
+                sync_da_height(&app_state, &celestia_client, current_height, &eds_dir).await;
+            } else {
+                // Remove old EDS files
+                let eds_file = eds_dir.join(format!("eds_{}.bin", current_height));
+                if eds_file.exists() {
+                    fs::remove_file(eds_file).expect("Failed to remove old EDS file");
+                }
             }
 
             current_height += 1;
-        }
-
-        // Update the sync height
-        {
-            let mut rollup_state = app_state.rollup_state.lock().unwrap();
-            rollup_state.sync_height = network_head.height().value();
         }
 
         // Sleep for a short duration before the next sync attempt
@@ -417,30 +407,33 @@ pub async fn da_sync_worker(app_state: web::Data<AppState>) {
     }
 }
 
-async fn sync_da_height(app_state: &web::Data<AppState>, client: &Client, da_height: u64) {
+async fn sync_da_height(app_state: &web::Data<AppState>, client: &Client, da_height: u64, eds_dir: &Path) {
+    let header = client
+        .header_get_by_height(da_height)
+        .await
+        .expect("Could not get header");
 
-    let namespace = app_state.rollup_state.lock().unwrap().namespace;
-    let blobs = match client
-            .blob_get_all(da_height, &[namespace])
-            .await
-    {
-        Ok(Some(blobs)) => blobs,
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            eprintln!("Error getting blobs at height {}: {}", da_height, e);
-            Vec::new()
-        }
-    };
+    let eds = client.share_get_eds(&header).await.expect("Failed to get EDS");
 
-    for blob in &blobs {
-        // Assuming you have a Block struct and a deserialize method
-        // let block = Block::deserialize(&blob.data);
-        // Process the block...
-        println!("Processing blob at height {}", da_height);
-    }
+    // Save EDS to file
+    let eds_file = eds_dir.join(format!("eds_{}.bin", da_height));
+    let eds_bytes = bincode::serialize(&eds).expect("Failed to serialize EDS");
+    fs::write(eds_file, eds_bytes).expect("Failed to write EDS file");
 
-    // Update the block height
-    let mut rollup_state = app_state.rollup_state.lock().unwrap();
-    rollup_state.block_height += blobs.len() as u64;
-    println!("Synced {} blobs at height {}", blobs.len(), da_height);
+    println!("Synced EDS for height {}", da_height);
+}
+
+fn get_last_synced_height(eds_dir: &Path) -> Option<u64> {
+    fs::read_dir(eds_dir)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let file_name = entry.file_name().into_string().ok()?;
+            if file_name.starts_with("eds_") && file_name.ends_with(".bin") {
+                file_name[4..file_name.len() - 4].parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .max()
 }
