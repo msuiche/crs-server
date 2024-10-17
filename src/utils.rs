@@ -77,5 +77,6 @@ pub fn get_server_url() -> String {
 pub fn get_tendermint_rpc_url() -> Result<String, String> {
     Args::parse().tm_rpc
         .or_else(|| env::var("TM_RPC").ok())
+        .or_else(|| Some("https://public-celestia-rpc.numia.xyz".to_string()))
         .ok_or_else(|| "TM_RPC is not set".to_string())
 }

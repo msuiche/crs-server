@@ -32,82 +32,115 @@ use std::path::Path;
 pub const ELF: &[u8] = include_bytes!("../riscv32im-succinct-zkvm-elf");
 
 pub async fn stark_proof_worker(app_state: web::Data<AppState>) {
-    println!("started stark worker");
+    println!("Started STARK proof worker");
     loop {
-
-        /* Not sure, but I think it's best if we lock the mutex in-line like this,
-           so it returns the lock after it's done. 
-         */
-        let proof_public_values = app_state.latest_proof.lock().unwrap().public_values.to_vec();
-        let latest_proof_inner = *match app_state.latest_proof.lock().unwrap().proof.clone() {
-            SP1Proof::Compressed(c) => c,
-            _ => panic!("Not the right kind of SP1 proof")
-        };
-
-        // Get the network head
-        let latest_height = app_state.client.get_latest_block_height().await;
-        let peer_id = app_state.client.fetch_peer_id().await.expect("could not fetch peer ID");
-        let net_head = app_state.client.fetch_light_block(latest_height, peer_id).await.expect("could not fetch latest head");
-
-        let mut header_to_try = net_head.clone();
-        let mut keep_trying = true;
-        while keep_trying {
-            let vp = ProdVerifier::default();
-            let opt = Options {
-                trust_threshold: Default::default(),
-                // 2 week trusting period.
-                trusting_period: Duration::from_secs(14 * 24 * 60 * 60),
-                clock_drift: Default::default(),
-            };
-            let verify_time = header_to_try.time() + Duration::from_secs(20);
-            let verdict = vp.verify_update_header(
-                header_to_try.clone().as_untrusted_state(),
-                app_state.newest_header.lock().unwrap().as_trusted_state(),
-                &opt,
-                verify_time.unwrap(),
-            );
-            match verdict {
-                Verdict::Success => {
-                    println!("this height worked.");
-                    keep_trying = false;
-                },
-                _ => {
-                    let highest_proved_height = app_state.newest_header.lock().unwrap().height().value();
-                    let height_to_try = highest_proved_height + ((header_to_try.height().value() - highest_proved_height) / 2);
-                    println!("backing up by half to height: {}", height_to_try);
-                    header_to_try = app_state.client.fetch_light_block(height_to_try, peer_id).await.expect("could not fetch height_to_try"); 
-                },
-            }
+        match stark_proof_iteration(&app_state).await {
+            Ok(_) => println!("STARK proof iteration completed successfully"),
+            Err(e) => eprintln!("Error in STARK proof worker: {}", e),
         }
 
-        let prover_client = ProverClient::new();
-        let (pk, vk) = prover_client.setup(ELF);
-        let mut stdin = SP1Stdin::new();
-        stdin.write(&vk.hash_u32());
-        stdin.write(&proof_public_values);
-        stdin.write_vec(app_state.genesis_header.signed_header.header.hash().as_bytes().to_vec());
-        let encoded1 = serde_cbor::to_vec(&app_state.newest_header).expect("Failed to cbor encode newest_header");
-        stdin.write_vec(encoded1);
-        let encoded2 = serde_cbor::to_vec(&header_to_try).expect("Failed to cbor encode net_head");
-        stdin.write_vec(encoded2);
-        stdin.write_proof(latest_proof_inner, vk.vk);
+        // Sleep for 5 minutes before the next iteration
+        tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+    }
+}
 
-        let start_time = std::time::Instant::now();
-        let resultant_proof = prover_client.prove(&pk, stdin).compressed().run().expect("could not prove");
-        let elapsed_time = start_time.elapsed();
-        println!("Elapsed time for CompressedSTARK proof generation: {:?}", elapsed_time);
-        // Write the updated net head to the newest_header_file
-        std::fs::write(app_state.app_dir.join("newest_header.json"), serde_json::to_string(&header_to_try).expect("could not json serialize net head after proving")).expect("Failed to write newest_header.json");
-        // Write the new proof to the proof_file
-        std::fs::write(app_state.app_dir.join("newest_proof.json"), serde_json::to_string(&resultant_proof).expect("could not json serialize new proof")).expect("Failed to write newest_proof.json");
-        // update the values in the server state
-        *app_state.newest_header.lock().unwrap() = header_to_try;
-        *app_state.latest_proof.lock().unwrap() = resultant_proof;
-        println!("proved header height {:?}", app_state.newest_header.lock().unwrap().height());
-        let five_minute = std::time::Duration::from_secs(5 * 60);
-        let sleep_duration = five_minute.saturating_sub(elapsed_time);
-        std::thread::sleep(sleep_duration);
+async fn stark_proof_iteration(app_state: &web::Data<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let proof_public_values = app_state.latest_proof.lock()
+        .map_err(|e| format!("Failed to lock latest_proof: {}", e))?
+        .as_ref()
+        .ok_or_else(|| "No latest proof available")?
+        .public_values.to_vec();
+    let latest_proof_inner = match app_state.latest_proof.lock()
+        .map_err(|e| format!("Failed to lock latest_proof: {}", e))?
+        .as_ref()
+        .ok_or_else(|| "No latest proof available")?
+        .proof.clone()
+    {
+        SP1Proof::Compressed(c) => *c,
+        _ => return Err("Not the right kind of SP1 proof".into()),
+    };
 
+    // Get the network head
+    let latest_height = app_state.client.get_latest_block_height().await;
+    let peer_id = app_state.client.fetch_peer_id().await?;
+    let net_head = app_state.client.fetch_light_block(latest_height, peer_id).await?;
+
+    let header_to_try = find_valid_header(app_state, net_head).await?;
+
+    let prover_client = ProverClient::new();
+    let (pk, vk) = prover_client.setup(ELF);
+    let mut stdin = SP1Stdin::new();
+    stdin.write(&vk.hash_u32());
+    stdin.write(&proof_public_values);
+    stdin.write_vec(app_state.genesis_header.signed_header.header.hash().as_bytes().to_vec());
+    let encoded1 = serde_cbor::to_vec(&app_state.newest_header.lock()
+        .map_err(|e| format!("Failed to lock newest_header: {}", e))?
+        .as_ref()
+        .ok_or_else(|| "No newest header available")?)
+        .map_err(|e| format!("Failed to cbor encode newest_header: {}", e))?;
+    stdin.write_vec(encoded1);
+    let encoded2 = serde_cbor::to_vec(&header_to_try)
+        .map_err(|e| format!("Failed to cbor encode net_head: {}", e))?;
+    stdin.write_vec(encoded2);
+    stdin.write_proof(latest_proof_inner, vk.vk);
+
+    let start_time = std::time::Instant::now();
+    let resultant_proof = prover_client.prove(&pk, stdin).compressed().run()
+        .map_err(|e| format!("Failed to generate CompressedSTARK proof: {}", e))?;
+    let elapsed_time = start_time.elapsed();
+    println!("Elapsed time for CompressedSTARK proof generation: {:?}", elapsed_time);
+
+    // Write the updated net head to the newest_header_file
+    std::fs::write(
+        app_state.app_dir.join("newest_header.json"),
+        serde_json::to_string(&header_to_try)?
+    ).map_err(|e| format!("Failed to write newest_header.json: {}", e))?;
+
+    // Write the new proof to the proof_file
+    std::fs::write(
+        app_state.app_dir.join("newest_proof.json"),
+        serde_json::to_string(&resultant_proof)?
+    ).map_err(|e| format!("Failed to write newest_proof.json: {}", e))?;
+
+    // update the values in the server state
+    *app_state.newest_header.lock()
+        .map_err(|e| format!("Failed to lock newest_header: {}", e))? = Some(header_to_try);
+    *app_state.latest_proof.lock()
+        .map_err(|e| format!("Failed to lock latest_proof: {}", e))? = Some(resultant_proof);
+    println!("Proved header height {:?}", app_state.newest_header.lock()
+        .map_err(|e| format!("Failed to lock newest_header: {}", e))?
+        .as_ref()
+        .ok_or_else(|| "No newest header available")?
+        .height());
+
+    Ok(())
+}
+
+async fn find_valid_header(app_state: &web::Data<AppState>, mut header_to_try: LightBlock) -> Result<LightBlock, Box<dyn std::error::Error>> {
+    loop {
+        let vp = ProdVerifier::default();
+        let opt = Options {
+            trust_threshold: Default::default(),
+            trusting_period: Duration::from_secs(14 * 24 * 60 * 60),
+            clock_drift: Default::default(),
+        };
+        let verify_time = header_to_try.time() + Duration::from_secs(20);
+        let verdict = vp.verify_update_header(
+            header_to_try.clone().as_untrusted_state(),
+            app_state.newest_header.lock().unwrap().as_ref().unwrap().as_trusted_state(),
+            &opt,
+            verify_time.map_err(|_| "Invalid header time")?,
+        );
+        match verdict {
+            Verdict::Success => return Ok(header_to_try),
+            _ => {
+                let highest_proved_height = app_state.newest_header.lock().unwrap().as_ref().unwrap().height().value();
+                let height_to_try = highest_proved_height + ((header_to_try.height().value() - highest_proved_height) / 2);
+                println!("backing up by half to height: {}", height_to_try);
+                let peer_id = app_state.client.fetch_peer_id().await?;
+                header_to_try = app_state.client.fetch_light_block(height_to_try, peer_id).await?;
+            },
+        }
     }
 }
 
@@ -116,104 +149,122 @@ pub async fn stark_proof_worker(app_state: web::Data<AppState>) {
 // so we have to waste resources :(
 // To minimize wasted resources, we will limit this worker to run once every 10 minutes or so.
 pub async fn groth_proof_worker(app_state: web::Data<AppState>) {
-    println!("started groth16 worker");
+    println!("Started Groth16 proof worker");
     loop {
-
-        /* Not sure, but I think it's best if we lock the mutex in-line like this,
-           so it returns the lock after it's done. 
-         */
-        let proof_public_values = app_state.latest_proof.lock().unwrap().public_values.to_vec();
-        let latest_proof_inner = *match app_state.latest_proof.lock().unwrap().proof.clone() {
-            SP1Proof::Compressed(c) => c,
-            _ => panic!("Not the right kind of SP1 proof")
-        };
-
-        // Get the network head
-        let latest_height = app_state.client.get_latest_block_height().await;
-        let peer_id = app_state.client.fetch_peer_id().await.expect("could not fetch peer ID");
-        let net_head = app_state.client.fetch_light_block(latest_height, peer_id).await.expect("could not fetch latest head");
-
-        let mut header_to_try = net_head.clone();
-        let mut keep_trying = true;
-        while keep_trying {
-            let vp = ProdVerifier::default();
-            let opt = Options {
-                trust_threshold: Default::default(),
-                // 2 week trusting period.
-                trusting_period: Duration::from_secs(14 * 24 * 60 * 60),
-                clock_drift: Default::default(),
-            };
-            let verify_time = header_to_try.time() + Duration::from_secs(20);
-            let verdict = vp.verify_update_header(
-                header_to_try.clone().as_untrusted_state(),
-                app_state.newest_header.lock().unwrap().as_trusted_state(),
-                &opt,
-                verify_time.unwrap(),
-            );
-            match verdict {
-                Verdict::Success => {
-                    println!("this height worked.");
-                    keep_trying = false;
-                },
-                _ => {
-                    let highest_proved_height = app_state.newest_header.lock().unwrap().height().value();
-                    let height_to_try = highest_proved_height + ((header_to_try.height().value() - highest_proved_height) / 2);
-                    println!("backing up by half to height: {}", height_to_try);
-                    header_to_try = app_state.client.fetch_light_block(height_to_try, peer_id).await.expect("could not fetch height_to_try"); 
-                },
-            }
+        match groth_proof_iteration(&app_state).await {
+            Ok(_) => println!("Groth16 proof iteration completed successfully"),
+            Err(e) => eprintln!("Error in Groth16 proof worker: {}", e),
         }
 
-        let prover_client = ProverClient::new();
-        let (pk, vk) = prover_client.setup(ELF);
-        let mut stdin = SP1Stdin::new();
-        stdin.write(&vk.hash_u32());
-        stdin.write(&proof_public_values);
-        stdin.write_vec(app_state.genesis_header.signed_header.header.hash().as_bytes().to_vec());
-        let encoded1 = serde_cbor::to_vec(&app_state.newest_header).expect("Failed to cbor encode newest_header");
-        stdin.write_vec(encoded1);
-        let encoded2 = serde_cbor::to_vec(&header_to_try).expect("Failed to cbor encode net_head");
-        stdin.write_vec(encoded2);
-        stdin.write_proof(latest_proof_inner, vk.vk);
-
-        let start_time = std::time::Instant::now();
-        let resultant_groth16_proof = prover_client.prove(&pk, stdin).groth16().run().expect("could not prove");
-        let elapsed_time = start_time.elapsed();
-        println!("Elapsed time for groth16 proof generation: {:?}", elapsed_time);
-        // Write the updated net head to the newest_header_file
-        match std::fs::write(app_state.app_dir.join("newest_groth16_proved_header.json"), serde_json::to_string(&header_to_try).expect("could not serialize")) {
-            Ok(_) => println!("Successfully wrote newest_groth16_proved_header.json"),
-            Err(e) => eprintln!("Failed to write newest_groth16_proved_header.json: {}", e),
-        }
-
-        match std::fs::write(app_state.app_dir.join("newest_groth16_proof.json"), serde_json::to_string(&resultant_groth16_proof).expect("could not json serialize new groth16 proof")) {
-            Ok(_) => println!("Successfully wrote newest_groth16_proof.json"),
-            Err(e) => eprintln!("Failed to write newest_groth16_proof.json: {}", e),
-        }
-        let groth_inner = resultant_groth16_proof.clone().proof.try_as_groth_16().expect("not a groth16 proof");
-        // Write the new proof to the proof_file
-        match std::fs::write(app_state.app_dir.join("newest_groth16_proof_inner.json"), serde_json::to_string(&groth_inner).expect("could not json serialize new groth16 proof")) {
-            Ok(_) => println!("Successfully wrote newest_groth16_proof_inner.json"),
-            Err(e) => eprintln!("Failed to write newest_groth16_proof_inner.json: {}", e),
-        }
-        // Write a bincode version as well
-        match std::fs::write(app_state.app_dir.join("newest_groth16_proof_inner.bin"), bincode::serialize(&groth_inner).expect("could not json serialize new groth16 proof")) {
-            Ok(_) => println!("Successfully wrote newest_groth16_proof_inner.bin"),
-            Err(e) => eprintln!("Failed to write newest_groth16_proof_inner.bin: {}", e),
-        }
-        // update the values in the server state
-        *app_state.latest_groth16_header.lock().unwrap() = Some(header_to_try);
-        *app_state.latest_groth16_proof.lock().unwrap() = Some(resultant_groth16_proof);
-        println!("groth16 proved header height {:?}", app_state.newest_header.lock().unwrap().height());
-        let ten_mins = std::time::Duration::from_secs(10 * 60);
-        let sleep_duration = ten_mins.saturating_sub(elapsed_time);
-        std::thread::sleep(sleep_duration);
-
+        tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
     }
 }
 
+async fn groth_proof_iteration(app_state: &web::Data<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let proof_public_values = app_state.latest_proof.lock().unwrap().as_ref().unwrap().public_values.to_vec();
+    let latest_proof_inner = *match app_state.latest_proof.lock().unwrap().as_ref().unwrap().proof.clone() {
+        SP1Proof::Compressed(c) => c,
+        _ => panic!("Not the right kind of SP1 proof")
+    };
+
+    // Get the network head
+    let latest_height = app_state.client.get_latest_block_height().await;
+    let peer_id = app_state.client.fetch_peer_id().await.expect("could not fetch peer ID");
+    let net_head = app_state.client.fetch_light_block(latest_height, peer_id).await.expect("could not fetch latest head");
+
+    let mut header_to_try = net_head.clone();
+    let mut keep_trying = true;
+    while keep_trying {
+        let vp = ProdVerifier::default();
+        let opt = Options {
+            trust_threshold: Default::default(),
+            // 2 week trusting period.
+            trusting_period: Duration::from_secs(14 * 24 * 60 * 60),
+            clock_drift: Default::default(),
+        };
+        let verify_time = header_to_try.time() + Duration::from_secs(20);
+        let verdict = vp.verify_update_header(
+            header_to_try.clone().as_untrusted_state(),
+            app_state.newest_header.lock().unwrap().as_ref().unwrap().as_trusted_state(),
+            &opt,
+            verify_time.unwrap(),
+        );
+        match verdict {
+            Verdict::Success => {
+                println!("this height worked.");
+                keep_trying = false;
+            },
+            _ => {
+                let highest_proved_height = app_state.newest_header.lock().unwrap().as_ref().unwrap().height().value();
+                let height_to_try = highest_proved_height + ((header_to_try.height().value() - highest_proved_height) / 2);
+                println!("backing up by half to height: {}", height_to_try);
+                header_to_try = app_state.client.fetch_light_block(height_to_try, peer_id).await.expect("could not fetch height_to_try"); 
+            },
+        }
+    }
+
+    let prover_client = ProverClient::new();
+    let (pk, vk) = prover_client.setup(ELF);
+    let mut stdin = SP1Stdin::new();
+    stdin.write(&vk.hash_u32());
+    stdin.write(&proof_public_values);
+    stdin.write_vec(app_state.genesis_header.signed_header.header.hash().as_bytes().to_vec());
+    let encoded1 = serde_cbor::to_vec(&app_state.newest_header.lock().unwrap().as_ref().unwrap()).expect("Failed to cbor encode newest_header");
+    stdin.write_vec(encoded1);
+    let encoded2 = serde_cbor::to_vec(&header_to_try).expect("Failed to cbor encode net_head");
+    stdin.write_vec(encoded2);
+    stdin.write_proof(latest_proof_inner, vk.vk);
+
+    let start_time = std::time::Instant::now();
+    let resultant_groth16_proof = match prover_client.prove(&pk, stdin).groth16().run() {
+        Ok(proof) => proof,
+        Err(e) => {
+            eprintln!("Failed to generate Groth16 proof: {:?}", e);
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Groth16 proof generation failed: {}", e)
+            )));
+        }
+    };
+    let elapsed_time = start_time.elapsed();
+    println!("Elapsed time for Groth16 proof generation: {:?}", elapsed_time);
+    // Write the updated net head to the newest_header_file
+    match std::fs::write(app_state.app_dir.join("newest_groth16_proved_header.json"), serde_json::to_string(&header_to_try).expect("could not serialize")) {
+        Ok(_) => println!("Successfully wrote newest_groth16_proved_header.json"),
+        Err(e) => eprintln!("Failed to write newest_groth16_proved_header.json: {}", e),
+    }
+
+    match std::fs::write(app_state.app_dir.join("newest_groth16_proof.json"), serde_json::to_string(&resultant_groth16_proof).expect("could not json serialize new groth16 proof")) {
+        Ok(_) => println!("Successfully wrote newest_groth16_proof.json"),
+        Err(e) => eprintln!("Failed to write newest_groth16_proof.json: {}", e),
+    }
+    let groth_inner = resultant_groth16_proof.clone().proof.try_as_groth_16().expect("not a groth16 proof");
+    // Write the new proof to the proof_file
+    match std::fs::write(app_state.app_dir.join("newest_groth16_proof_inner.json"), serde_json::to_string(&groth_inner).expect("could not json serialize new groth16 proof")) {
+        Ok(_) => println!("Successfully wrote newest_groth16_proof_inner.json"),
+        Err(e) => eprintln!("Failed to write newest_groth16_proof_inner.json: {}", e),
+    }
+    // Write a bincode version as well
+    match std::fs::write(app_state.app_dir.join("newest_groth16_proof_inner.bin"), bincode::serialize(&groth_inner).expect("could not json serialize new groth16 proof")) {
+        Ok(_) => println!("Successfully wrote newest_groth16_proof_inner.bin"),
+        Err(e) => eprintln!("Failed to write newest_groth16_proof_inner.bin: {}", e),
+    }
+    // update the values in the server state
+    *app_state.latest_groth16_header.lock().unwrap() = Some(header_to_try);
+    *app_state.latest_groth16_proof.lock().unwrap() = Some(resultant_groth16_proof);
+    println!("Groth16 proved header height {:?}", app_state.newest_header.lock().unwrap().as_ref().unwrap().height());
+    let ten_mins = std::time::Duration::from_secs(10 * 60);
+    let sleep_duration = ten_mins.saturating_sub(elapsed_time);
+    std::thread::sleep(sleep_duration);
+
+    Ok(())
+}
+
 async fn get_latest_header(app_state: web::Data<AppState>) -> impl Responder {
-    HttpResponse::Ok().json(app_state.newest_header.lock().unwrap().clone())
+    match app_state.newest_header.lock().unwrap().clone() {
+        Some(header) => HttpResponse::Ok().json(header),
+        None => HttpResponse::NotFound().body("No latest header available"),
+    }
 }
 
 /*async fn get_latest_groth16_proved_stripped_header(app_state: web::Data<AppState>) -> impl Responder {
@@ -247,7 +298,10 @@ async fn get_net_head_stripped(app_state: web::Data<AppState>) -> impl Responder
 }
 
 async fn get_latest_proof(app_state: web::Data<AppState>) -> impl Responder {
-    HttpResponse::Ok().json(app_state.latest_proof.lock().unwrap().clone())
+    match app_state.latest_proof.lock().unwrap().clone() {
+        Some(proof) => HttpResponse::Ok().json(proof),
+        None => HttpResponse::NotFound().body("No latest proof available"),
+    }
 }
 
 async fn get_latest_groth16_proof(app_state: web::Data<AppState>) -> impl Responder {
@@ -260,8 +314,8 @@ async fn get_latest_groth16_proof(app_state: web::Data<AppState>) -> impl Respon
 pub struct AppState {
     pub app_dir: PathBuf,
     pub client: Arc<TendermintRPCClient>,
-    pub newest_header: Arc<Mutex<LightBlock>>,
-    pub latest_proof: Arc<Mutex<SP1ProofWithPublicValues>>,
+    pub newest_header: Arc<Mutex<Option<LightBlock>>>,
+    pub latest_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>>,
     pub latest_groth16_header: Arc<Mutex<Option<LightBlock>>>,
     pub latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>>,
     pub genesis_header: LightBlock,
@@ -270,67 +324,55 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let app_dir = match get_crs_directory() {
-        Ok(dir) => dir,
-        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Could not open directory: {}", e))),
-    };
+    
+    let app_dir = get_crs_directory()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Could not open directory: {}", e)))?;
 
-    let tm_rpc_url = match get_tendermint_rpc_url() {
-        Ok(url) => url,
-        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("TM_RPC not set: {}", e))),
-    };
+    let tm_rpc_url = get_tendermint_rpc_url()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TM_RPC not set: {}", e)))?;
 
     let tm_client = tm_rpc_utils::TendermintRPCClient::new(tm_rpc_url);
-    let peer_id = match tm_client.fetch_peer_id().await {
-        Ok(id) => id,
-        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to fetch peer ID: {}", e))),
-    };
+    let peer_id = tm_client.fetch_peer_id().await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to fetch peer ID: {}", e)))?;
 
     // Load the "zk genesis" header
     let genesis_header: LightBlock = match std::fs::File::open(app_dir.join("genesis.json")) {
         Ok(file) => {
-            match serde_json::from_reader(file) {
-                Ok(header) => header,
-                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to parse genesis.json: {}", e))),
-            }
+            serde_json::from_reader(file)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to parse genesis.json: {}", e)))?
         },
         Err(_) => {
             println!("Genesis file not found, getting it from the tendermint RPC.");
-            let genesis = match tm_client.fetch_light_block(1, peer_id).await {
-                Ok(block) => block,
-                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Could not fetch genesis from tendermint RPC: {}", e))),
-            };
+            let genesis = tm_client.fetch_light_block(1, peer_id).await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Could not fetch genesis from tendermint RPC: {}", e)))?;
             
-            let file = match std::fs::File::create(app_dir.join("genesis.json")) {
-                Ok(f) => f,
-                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create genesis.json: {}", e))),
-            };
+            let file = std::fs::File::create(app_dir.join("genesis.json"))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create genesis.json: {}", e)))?;
             
-            if let Err(e) = serde_json::to_writer(&file, &genesis) {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write genesis to genesis.json: {}", e)));
-            }
+            serde_json::to_writer(&file, &genesis)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write genesis to genesis.json: {}", e)))?;
             
             genesis
         }
     };
-    let newest_header: Arc<Mutex<LightBlock>> = match std::fs::File::open(app_dir.join("newest_header.json")) {
+    let newest_header: Arc<Mutex<Option<LightBlock>>> = match std::fs::File::open(app_dir.join("newest_header.json")) {
         Ok(file) => {
             match serde_json::from_reader(file) {
-                Ok(header) => Arc::new(Mutex::new(header)),
+                Ok(header) => Arc::new(Mutex::new(Some(header))),
                 Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to parse newest_header.json: {}", e))),
             }
         },
-        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Failed to read newest_header.json: {}", e))),
+        Err(_) => Arc::new(Mutex::new(Some(genesis_header.clone()))), // Initialize with genesis header if file doesn't exist
     };
 
-    let latest_proof: Arc<Mutex<SP1ProofWithPublicValues>> = match std::fs::File::open(app_dir.join("newest_proof.json")) {
+    let latest_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>> = match std::fs::File::open(app_dir.join("newest_proof.json")) {
         Ok(file) => {
             match serde_json::from_reader(file) {
-                Ok(proof) => Arc::new(Mutex::new(proof)),
+                Ok(proof) => Arc::new(Mutex::new(Some(proof))),
                 Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to deserialize proof: {}", e))),
             }
         },
-        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Could not open newest_proof.json: {}", e))),
+        Err(_) => Arc::new(Mutex::new(None)), // Initialize with None if file doesn't exist
     };
 
     let latest_groth16_proof: Arc<Mutex<Option<SP1ProofWithPublicValues>>> = Arc::new(Mutex::new(
@@ -361,13 +403,13 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let app_state = web::Data::new(AppState {
-        app_dir: app_dir,
+        app_dir: app_dir.clone(),
         client: Arc::new(tm_client),
         newest_header: newest_header.clone(),
         latest_proof: latest_proof.clone(),
         latest_groth16_proof: latest_groth16_proof.clone(),
         latest_groth16_header: latest_groth16_proved_header.clone(),
-        genesis_header: genesis_header,
+        genesis_header: genesis_header.clone(),
         celestia_client: Arc::new(
             Client::new("ws://localhost:26658", Some(&std::env::var("CELESTIA_TOKEN").expect("CELESTIA_TOKEN not set")))
                 .await
@@ -375,10 +417,23 @@ async fn main() -> std::io::Result<()> {
         ),
     });
 
+    // Check if we need to run stark_proof_iteration once
+    let newest_header_exists = std::path::Path::new(&app_dir).join("newest_header.json").exists();
+    let newest_proof_exists = std::path::Path::new(&app_dir).join("newest_proof.json").exists();
+
+    if !newest_header_exists || !newest_proof_exists {
+        println!("Running initial stark_proof_iteration...");
+        match stark_proof_iteration(&app_state).await {
+            Ok(_) => println!("Initial stark_proof_iteration completed successfully"),
+            Err(e) => eprintln!("Error in initial stark_proof_iteration: {}", e),
+        }
+    }
+
     let _stark_handle = tokio::spawn(stark_proof_worker(app_state.clone()));
     let _groth16_handle = tokio::spawn(groth_proof_worker(app_state.clone()));
     let _da_sync_handle = tokio::spawn(da_sync_worker(app_state.clone()));
 
+    println!("Starting HTTP server on {}", get_server_url());
     let _server_handle = HttpServer::new(move || {
 
         let cors = Cors::permissive();
